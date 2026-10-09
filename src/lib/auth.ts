@@ -1,6 +1,6 @@
 import { Elysia } from "elysia";
 import { db as sharedDb } from "../db";
-import type { Database } from "bun:sqlite";
+import type { SQL } from "bun";
 
 /**
  * Backend authentication primitives: password hashing, stateless JWT
@@ -185,12 +185,12 @@ function extractBearer(authorization: string | undefined): string | null {
 }
 
 /** Load a user row by id from the given database connection. */
-export function findUserById(id: number, database: Database): UserRow | null {
-  return (
-    database
-      .query<UserRow, [number]>("SELECT * FROM users WHERE id = ?")
-      .get(id) ?? null
-  );
+export async function findUserById(
+  id: number,
+  database: SQL,
+): Promise<UserRow | null> {
+  const [row] = await database`SELECT * FROM users WHERE id = ${id}`;
+  return (row as UserRow | undefined) ?? null;
 }
 
 /**
@@ -206,8 +206,8 @@ export function findUserById(id: number, database: Database): UserRow | null {
  * The `database` argument is injectable so tests can pass a temp DB; it
  * defaults to the shared singleton connection.
  */
-export const authGuard = (database: Database = sharedDb) =>
-  new Elysia({ name: "auth-guard", seed: database })
+export const authGuard = (database: SQL = sharedDb) =>
+  new Elysia({ name: "auth-guard" })
     .error({ UNAUTHORIZED: UnauthorizedError })
     .onError({ as: "scoped" }, ({ code, error, set }) => {
       if (code === "UNAUTHORIZED") {
@@ -215,14 +215,14 @@ export const authGuard = (database: Database = sharedDb) =>
         return { error: (error as UnauthorizedError).message };
       }
     })
-    .resolve({ as: "scoped" }, ({ headers }) => {
+    .resolve({ as: "scoped" }, async ({ headers }) => {
       const token = extractBearer(headers.authorization);
       if (!token) throw new UnauthorizedError();
 
       const decoded = verifyToken(token);
       if (!decoded) throw new UnauthorizedError();
 
-      const user = findUserById(decoded.userId, database);
+      const user = await findUserById(decoded.userId, database);
       if (!user) throw new UnauthorizedError();
 
       return { userId: user.id, user };

@@ -8,7 +8,7 @@ Bun ecosystem — no Node.js, Vite, or Webpack.
 - **Runtime & bundler:** Bun (built-in Fullstack Dev Server via HTML imports + `Bun.serve()`)
 - **Frontend:** React 19 + Tailwind CSS v4 + shadcn/ui (new-york, neutral, CSS variables) with `lucide-react` icons
 - **Backend:** ElysiaJS REST API mounted under `/api`
-- **Database:** Bun's native SQLite (`bun:sqlite`), no external database
+- **Database:** PostgreSQL via Bun's built-in SQL client (`import { SQL } from "bun"`), no external driver or ORM
 - **Auth:** real JWT auth with `Bun.password` (argon2id) hashing; per-user data isolation enforced server-side
 
 One `Bun.serve()` process serves the bundled SPA and the Elysia API on a single
@@ -34,6 +34,11 @@ is a single command on a single port that serves both the React app and the API.
 ### Environment
 
 - `PORT` — HTTP port (default `3000`).
+- `DATABASE_URL` — PostgreSQL connection string. When unset, the documented
+  default `postgres://postgres:password@localhost:5432/booksonline` is used.
+- `TEST_DATABASE_URL` — connection string the test suite uses. When unset, the
+  tests fall back to `DATABASE_URL`/the default above; point this at a separate
+  database if you don't want tests sharing the primary one.
 - `JWT_SECRET` — secret used to sign/verify JWTs. If unset, a documented dev
   fallback constant (`dev-only-insecure-secret-change-me`) is used so the app
   runs out of the box. **Set a real `JWT_SECRET` in production** — the dev
@@ -41,11 +46,18 @@ is a single command on a single port that serves both the React app and the API.
 
 ### Database
 
-`store.sqlite` is created automatically at the project root on the first server
-run: the schema is created and a sample catalogue of popular books (priced in
-INR) is seeded. Subsequent boots are no-ops (seeding is idempotent). The file is
-gitignored and must not be committed. Tests use an in-memory/temp DB and never
-touch `store.sqlite`.
+The app stores all data in **PostgreSQL**, accessed through Bun's built-in SQL
+client (`import { SQL } from "bun"`) — no external driver, ORM, or Node tooling.
+A running PostgreSQL server and a database named `booksonline` are
+prerequisites; the app connects via `DATABASE_URL` (default
+`postgres://postgres:password@localhost:5432/booksonline`). All connection
+configuration is centralized in `src/db/index.ts`.
+
+On the first server run the schema is created and a sample catalogue of popular
+books (priced in INR) is seeded. Both steps are idempotent (`CREATE TABLE IF
+NOT EXISTS`; seeding only when the catalogue is empty), so subsequent boots are
+no-ops. The test suite applies the same schema/seed and TRUNCATEs its tables
+before and after each run, so it never leaves residual rows.
 
 ## Money & gift points
 

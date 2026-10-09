@@ -1,5 +1,5 @@
 import { Elysia, t } from "elysia";
-import type { Database } from "bun:sqlite";
+import type { SQL } from "bun";
 import { db as sharedDb } from "../db";
 import { authGuard } from "../lib/auth";
 
@@ -38,42 +38,42 @@ export interface CartView {
 }
 
 /** Resolve (creating if absent) the id of the authenticated user's cart. */
-function getOrCreateCartId(database: Database, userId: number): number {
-  const existing = database
-    .query<{ id: number }, [number]>(
-      "SELECT id FROM carts WHERE user_id = ?",
-    )
-    .get(userId);
+async function getOrCreateCartId(
+  database: SQL,
+  userId: number,
+): Promise<number> {
+  const [existing] = (await database`
+    SELECT id FROM carts WHERE user_id = ${userId}
+  `) as [{ id: number }?];
   if (existing) return existing.id;
 
-  const created = database
-    .query<{ id: number }, [number]>(
-      "INSERT INTO carts (user_id) VALUES (?) RETURNING id",
-    )
-    .get(userId);
+  const [created] = (await database`
+    INSERT INTO carts (user_id) VALUES (${userId}) RETURNING id
+  `) as [{ id: number }?];
   // RETURNING guarantees a row; the ?? is only to satisfy the types.
   return created?.id ?? 0;
 }
 
 /** Build the full cart view for a cart id (items + totals). */
-export function buildCartView(database: Database, cartId: number): CartView {
-  const items = database
-    .query<CartItemView, [number]>(
-      `SELECT ci.id            AS id,
-              ci.book_id       AS book_id,
-              b.title          AS title,
-              b.author         AS author,
-              b.cover_url      AS cover_url,
-              b.price_cents    AS unit_price_cents,
-              ci.quantity      AS quantity,
-              b.price_cents * ci.quantity AS line_total_cents,
-              b.stock          AS stock
-         FROM cart_items ci
-         JOIN books b ON b.id = ci.book_id
-        WHERE ci.cart_id = ?
-        ORDER BY ci.id ASC`,
-    )
-    .all(cartId);
+export async function buildCartView(
+  database: SQL,
+  cartId: number,
+): Promise<CartView> {
+  const items = (await database`
+    SELECT ci.id            AS id,
+           ci.book_id       AS book_id,
+           b.title          AS title,
+           b.author         AS author,
+           b.cover_url      AS cover_url,
+           b.price_cents    AS unit_price_cents,
+           ci.quantity      AS quantity,
+           b.price_cents * ci.quantity AS line_total_cents,
+           b.stock          AS stock
+      FROM cart_items ci
+      JOIN books b ON b.id = ci.book_id
+     WHERE ci.cart_id = ${cartId}
+     ORDER BY ci.id ASC
+  `) as CartItemView[];
 
   const subtotal_cents = items.reduce((sum, i) => sum + i.line_total_cents, 0);
   const item_count = items.reduce((sum, i) => sum + i.quantity, 0);
@@ -81,7 +81,7 @@ export function buildCartView(database: Database, cartId: number): CartView {
   return { items, subtotal_cents, item_count };
 }
 
-export const cartRoutes = (database: Database = sharedDb) =>
+export const cartRoutes = (database: SQL = sharedDb) =>
   new Elysia({ prefix: "/cart" })
     .onError(({ code, set }) => {
       if (code === "VALIDATION") {
@@ -91,31 +91,28 @@ export const cartRoutes = (database: Database = sharedDb) =>
     })
     .use(authGuard(database))
     // --- Read the current cart --------------------------------------------
-    .get("/", ({ userId }) => {
-      const cartId = getOrCreateCartId(database, userId);
+    .get("/", async ({ userId }) => {
+      const cartId = await getOrCreateCartId(database, userId);
       return buildCartView(database, cartId);
     })
     // --- Add or increment an item -----------------------------------------
     .post(
       "/items",
-      ({ userId, body, set }) => {
-        const cartId = getOrCreateCartId(database, userId);
+      async ({ userId, body, set }) => {
+        const cartId = await getOrCreateCartId(database, userId);
 
-        const book = database
-          .query<{ id: number; stock: number }, [number]>(
-            "SELECT id, stock FROM books WHERE id = ?",
-          )
-          .get(body.bookId);
+        const [book] = (await database`
+          SELECT id, stock FROM books WHERE id = ${body.bookId}
+        `) as [{ id: number; stock: number }?];
         if (!book) {
           set.status = 404;
           return { error: "Book not found" };
         }
 
-        const existing = database
-          .query<{ id: number; quantity: number }, [number, number]>(
-            "SELECT id, quantity FROM cart_items WHERE cart_id = ? AND book_id = ?",
-          )
-          .get(cartId, body.bookId);
+        const [existing] = (await database`
+          SELECT id, quantity FROM cart_items
+           WHERE cart_id = ${cartId} AND book_id = ${body.bookId}
+        `) as [{ id: number; quantity: number }?];
 
         const desiredQty = (existing?.quantity ?? 0) + body.quantity;
         if (desiredQty > book.stock) {
@@ -124,15 +121,14 @@ export const cartRoutes = (database: Database = sharedDb) =>
         }
 
         if (existing) {
-          database.run("UPDATE cart_items SET quantity = ? WHERE id = ?", [
-            desiredQty,
-            existing.id,
-          ]);
+          await database`
+            UPDATE cart_items SET quantity = ${desiredQty} WHERE id = ${existing.id}
+          `;
         } else {
-          database.run(
-            "INSERT INTO cart_items (cart_id, book_id, quantity) VALUES (?, ?, ?)",
-            [cartId, body.bookId, body.quantity],
-          );
+          await database`
+            INSERT INTO cart_items (cart_id, book_id, quantity)
+            VALUES (${cartId}, ${body.bookId}, ${body.quantity})
+          `;
         }
 
         return buildCartView(database, cartId);
@@ -147,38 +143,34 @@ export const cartRoutes = (database: Database = sharedDb) =>
     // --- Update a line quantity (0 removes) -------------------------------
     .patch(
       "/items/:id",
-      ({ userId, params, body, set }) => {
-        const cartId = getOrCreateCartId(database, userId);
+      async ({ userId, params, body, set }) => {
+        const cartId = await getOrCreateCartId(database, userId);
 
-        const item = database
-          .query<{ id: number; book_id: number }, [number, number]>(
-            "SELECT id, book_id FROM cart_items WHERE id = ? AND cart_id = ?",
-          )
-          .get(params.id, cartId);
+        const [item] = (await database`
+          SELECT id, book_id FROM cart_items
+           WHERE id = ${params.id} AND cart_id = ${cartId}
+        `) as [{ id: number; book_id: number }?];
         if (!item) {
           set.status = 404;
           return { error: "Cart item not found" };
         }
 
         if (body.quantity === 0) {
-          database.run("DELETE FROM cart_items WHERE id = ?", [item.id]);
+          await database`DELETE FROM cart_items WHERE id = ${item.id}`;
           return buildCartView(database, cartId);
         }
 
-        const book = database
-          .query<{ stock: number }, [number]>(
-            "SELECT stock FROM books WHERE id = ?",
-          )
-          .get(item.book_id);
+        const [book] = (await database`
+          SELECT stock FROM books WHERE id = ${item.book_id}
+        `) as [{ stock: number }?];
         if (book && body.quantity > book.stock) {
           set.status = 409;
           return { error: "Insufficient stock" };
         }
 
-        database.run("UPDATE cart_items SET quantity = ? WHERE id = ?", [
-          body.quantity,
-          item.id,
-        ]);
+        await database`
+          UPDATE cart_items SET quantity = ${body.quantity} WHERE id = ${item.id}
+        `;
         return buildCartView(database, cartId);
       },
       {
@@ -189,20 +181,18 @@ export const cartRoutes = (database: Database = sharedDb) =>
     // --- Remove a line ----------------------------------------------------
     .delete(
       "/items/:id",
-      ({ userId, params, set }) => {
-        const cartId = getOrCreateCartId(database, userId);
+      async ({ userId, params, set }) => {
+        const cartId = await getOrCreateCartId(database, userId);
 
-        const item = database
-          .query<{ id: number }, [number, number]>(
-            "SELECT id FROM cart_items WHERE id = ? AND cart_id = ?",
-          )
-          .get(params.id, cartId);
+        const [item] = (await database`
+          SELECT id FROM cart_items WHERE id = ${params.id} AND cart_id = ${cartId}
+        `) as [{ id: number }?];
         if (!item) {
           set.status = 404;
           return { error: "Cart item not found" };
         }
 
-        database.run("DELETE FROM cart_items WHERE id = ?", [item.id]);
+        await database`DELETE FROM cart_items WHERE id = ${item.id}`;
         return buildCartView(database, cartId);
       },
       {

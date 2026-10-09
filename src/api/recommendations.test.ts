@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { Elysia } from "elysia";
-import { Database } from "bun:sqlite";
+import type { SQL } from "bun";
+import { openDb } from "../db";
 import { initSchema } from "../db/schema";
 import { seedIfEmpty } from "../db/seed";
 import { authRoutes } from "./auth";
@@ -8,33 +9,39 @@ import { recommendationRoutes } from "./recommendations";
 import type { BookRow } from "./books";
 
 /**
- * Recommendation endpoint tests against an in-memory, freshly seeded
- * bun:sqlite database. Two users are registered: one with no order history
- * (expects the popular fallback) and one with a seeded order in a known
- * category (expects history-driven results that exclude purchased titles).
+ * Recommendation endpoint tests against PostgreSQL via Bun.sql. The target is
+ * TEST_DATABASE_URL when set, otherwise the primary booksonline database. Two
+ * users are registered: one with no order history (expects the popular
+ * fallback) and one with a seeded order in a known category (expects
+ * history-driven results that exclude purchased titles). TRUNCATE RESTART
+ * IDENTITY CASCADE keeps ids deterministic and isolates the suite.
  */
 
 type App = ReturnType<typeof buildApp>;
 
-function buildApp(database: Database) {
+function buildApp(database: SQL) {
   return new Elysia({ prefix: "/api" })
     .use(authRoutes(database))
     .use(recommendationRoutes(database));
 }
 
-let app: App;
-let db: Database;
+const ALL_TABLES =
+  "order_items, orders, cart_items, carts, addresses, users, books";
 
-beforeAll(() => {
-  db = new Database(":memory:");
-  db.exec("PRAGMA foreign_keys = ON;");
-  initSchema(db);
-  seedIfEmpty(db);
+let app: App;
+let db: SQL;
+
+beforeAll(async () => {
+  db = openDb(process.env.TEST_DATABASE_URL ?? undefined);
+  await initSchema(db);
+  await db.unsafe(`TRUNCATE ${ALL_TABLES} RESTART IDENTITY CASCADE`);
+  await seedIfEmpty(db);
   app = buildApp(db);
 });
 
-afterAll(() => {
-  db.close();
+afterAll(async () => {
+  await db.unsafe(`TRUNCATE ${ALL_TABLES} RESTART IDENTITY CASCADE`);
+  await db.end();
 });
 
 async function register(email: string): Promise<{ token: string; id: number }> {
@@ -61,27 +68,31 @@ async function getRecommendations(
 }
 
 /** Insert a paid order for `userId` containing a single `bookId`. */
-function seedOrder(userId: number, bookId: number): void {
-  const book = db
-    .query<BookRow, [number]>("SELECT * FROM books WHERE id = ?")
-    .get(bookId)!;
+async function seedOrder(userId: number, bookId: number): Promise<void> {
+  const [book] = (await db`SELECT * FROM books WHERE id = ${bookId}`) as [
+    BookRow,
+  ];
 
-  const order = db
-    .query<{ id: number }, [number, number, number]>(
-      `INSERT INTO orders
-         (user_id, address_snapshot, status, subtotal_cents, total_cents,
-          cancellable_until)
-       VALUES (?, '{}', 'paid', ?, ?, datetime('now', '+48 hours'))
-       RETURNING id`,
-    )
-    .get(userId, book.price_cents, book.price_cents)!;
+  // cancellable_until 48h in the future, computed in JS (no SQLite datetime()).
+  const cancellableUntil = new Date(
+    Date.now() + 48 * 60 * 60 * 1000,
+  ).toISOString();
 
-  db.run(
-    `INSERT INTO order_items
-       (order_id, book_id, title, author, unit_price_cents, quantity)
-     VALUES (?, ?, ?, ?, ?, 1)`,
-    [order.id, book.id, book.title, book.author, book.price_cents],
-  );
+  const [order] = (await db`
+    INSERT INTO orders
+      (user_id, address_snapshot, status, subtotal_cents, total_cents,
+       cancellable_until)
+    VALUES (${userId}, '{}', 'paid', ${book.price_cents}, ${book.price_cents},
+            ${cancellableUntil})
+    RETURNING id
+  `) as [{ id: number }];
+
+  await db`
+    INSERT INTO order_items
+      (order_id, book_id, title, author, unit_price_cents, quantity)
+    VALUES (${order.id}, ${book.id}, ${book.title}, ${book.author},
+            ${book.price_cents}, 1)
+  `;
 }
 
 describe("GET /api/recommendations", () => {
@@ -103,12 +114,10 @@ describe("GET /api/recommendations", () => {
     const { token, id } = await register("buyer@example.com");
 
     // Buy a Fantasy book (The Hobbit, id 5 per the seed order).
-    const bought = db
-      .query<BookRow, [string]>(
-        "SELECT * FROM books WHERE category = ? ORDER BY id ASC LIMIT 1",
-      )
-      .get("Fantasy")!;
-    seedOrder(id, bought.id);
+    const [bought] = (await db`
+      SELECT * FROM books WHERE category = ${"Fantasy"} ORDER BY id ASC LIMIT 1
+    `) as [BookRow];
+    await seedOrder(id, bought.id);
 
     const { items, source } = await getRecommendations(token);
     expect(items.length).toBeGreaterThan(0);

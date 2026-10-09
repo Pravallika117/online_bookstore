@@ -1,33 +1,39 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { Elysia } from "elysia";
-import { Database } from "bun:sqlite";
+import type { SQL } from "bun";
+import { openDb } from "../db";
 import { initSchema } from "../db/schema";
 import { authRoutes } from "./auth";
 
 type App = ReturnType<typeof buildApp>;
 
-function buildApp(database: Database) {
+function buildApp(database: SQL) {
   return new Elysia({ prefix: "/api" }).use(authRoutes(database));
 }
 
 /**
- * Auth endpoint tests against an in-memory bun:sqlite database so the real
- * store.sqlite is never touched. The app is composed exactly like the real
- * /api app but with the temp DB injected into authRoutes().
+ * Auth endpoint tests against PostgreSQL via Bun.sql. The target is
+ * TEST_DATABASE_URL when set, otherwise the primary booksonline database. The
+ * suite TRUNCATEs every table (RESTART IDENTITY CASCADE) before and after so
+ * it is isolated from, and leaves nothing for, the other suites.
  */
 
-let app: App;
-let db: Database;
+const ALL_TABLES =
+  "order_items, orders, cart_items, carts, addresses, users, books";
 
-beforeAll(() => {
-  db = new Database(":memory:");
-  db.exec("PRAGMA foreign_keys = ON;");
-  initSchema(db);
+let app: App;
+let db: SQL;
+
+beforeAll(async () => {
+  db = openDb(process.env.TEST_DATABASE_URL ?? undefined);
+  await initSchema(db);
+  await db.unsafe(`TRUNCATE ${ALL_TABLES} RESTART IDENTITY CASCADE`);
   app = buildApp(db);
 });
 
-afterAll(() => {
-  db.close();
+afterAll(async () => {
+  await db.unsafe(`TRUNCATE ${ALL_TABLES} RESTART IDENTITY CASCADE`);
+  await db.end();
 });
 
 function post(path: string, body: unknown, token?: string) {
@@ -70,11 +76,9 @@ describe("auth", () => {
     expect(data.user).not.toHaveProperty("password_hash");
   });
 
-  it("provisions a cart row for the new user", () => {
-    const row = db
-      .query<{ count: number }, []>("SELECT COUNT(*) AS count FROM carts")
-      .get();
-    expect(row?.count).toBe(1);
+  it("provisions a cart row for the new user", async () => {
+    const [row] = await db`SELECT COUNT(*)::int AS count FROM carts`;
+    expect(Number(row?.count)).toBe(1);
   });
 
   it("rejects a duplicate email with 409", async () => {

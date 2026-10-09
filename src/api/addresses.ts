@@ -1,5 +1,5 @@
 import { Elysia, t } from "elysia";
-import type { Database } from "bun:sqlite";
+import type { SQL } from "bun";
 import { db as sharedDb } from "../db";
 import { authGuard } from "../lib/auth";
 
@@ -29,14 +29,20 @@ export interface AddressRow {
   is_default: number;
 }
 
+/**
+ * The explicit column list for address SELECT/RETURNING. The is_default
+ * column is a Postgres BOOLEAN, but the API contract (and the frontend) treat
+ * is_default as a numeric 0|1 field, so it is coerced back with (is_default)::int.
+ */
+const ADDRESS_COLUMNS = `id, user_id, label, recipient, line1, line2, city,
+  state, postal_code, country, (is_default)::int AS is_default`;
+
 /** Clear the default flag on all of a user's addresses (used before setting one). */
-function clearDefault(database: Database, userId: number): void {
-  database.run("UPDATE addresses SET is_default = 0 WHERE user_id = ?", [
-    userId,
-  ]);
+async function clearDefault(database: SQL, userId: number): Promise<void> {
+  await database`UPDATE addresses SET is_default = false WHERE user_id = ${userId}`;
 }
 
-export const addressRoutes = (database: Database = sharedDb) =>
+export const addressRoutes = (database: SQL = sharedDb) =>
   new Elysia({ prefix: "/addresses" })
     .onError(({ code, set }) => {
       if (code === "VALIDATION") {
@@ -46,56 +52,29 @@ export const addressRoutes = (database: Database = sharedDb) =>
     })
     .use(authGuard(database))
     // --- List the user's addresses ----------------------------------------
-    .get("/", ({ userId }) => {
-      const items = database
-        .query<AddressRow, [number]>(
-          `SELECT * FROM addresses
-            WHERE user_id = ?
-            ORDER BY is_default DESC, id ASC`,
-        )
-        .all(userId);
+    .get("/", async ({ userId }) => {
+      const items = (await database`
+        SELECT ${database.unsafe(ADDRESS_COLUMNS)} FROM addresses
+         WHERE user_id = ${userId}
+         ORDER BY is_default DESC, id ASC
+      `) as AddressRow[];
       return { items };
     })
     // --- Create a new address ---------------------------------------------
     .post(
       "/",
-      ({ userId, body }) => {
+      async ({ userId, body }) => {
         const makeDefault = body.is_default === true;
-        if (makeDefault) clearDefault(database, userId);
+        if (makeDefault) await clearDefault(database, userId);
 
-        const created = database
-          .query<
-            AddressRow,
-            [
-              number,
-              string,
-              string,
-              string,
-              string | null,
-              string,
-              string,
-              string,
-              string,
-              number,
-            ]
-          >(
-            `INSERT INTO addresses
-               (user_id, label, recipient, line1, line2, city, state, postal_code, country, is_default)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-             RETURNING *`,
-          )
-          .get(
-            userId,
-            body.label,
-            body.recipient,
-            body.line1,
-            body.line2 ?? null,
-            body.city,
-            body.state,
-            body.postal_code,
-            body.country,
-            makeDefault ? 1 : 0,
-          );
+        const [created] = (await database`
+          INSERT INTO addresses
+            (user_id, label, recipient, line1, line2, city, state, postal_code, country, is_default)
+          VALUES (${userId}, ${body.label}, ${body.recipient}, ${body.line1},
+                  ${body.line2 ?? null}, ${body.city}, ${body.state},
+                  ${body.postal_code}, ${body.country}, ${makeDefault})
+          RETURNING ${database.unsafe(ADDRESS_COLUMNS)}
+        `) as [AddressRow?];
 
         return { address: created };
       },
@@ -116,18 +95,17 @@ export const addressRoutes = (database: Database = sharedDb) =>
     // --- Update an owned address ------------------------------------------
     .patch(
       "/:id",
-      ({ userId, params, body, set }) => {
-        const existing = database
-          .query<AddressRow, [number, number]>(
-            "SELECT * FROM addresses WHERE id = ? AND user_id = ?",
-          )
-          .get(params.id, userId);
+      async ({ userId, params, body, set }) => {
+        const [existing] = (await database`
+          SELECT ${database.unsafe(ADDRESS_COLUMNS)} FROM addresses
+           WHERE id = ${params.id} AND user_id = ${userId}
+        `) as [AddressRow?];
         if (!existing) {
           set.status = 404;
           return { error: "Address not found" };
         }
 
-        if (body.is_default === true) clearDefault(database, userId);
+        if (body.is_default === true) await clearDefault(database, userId);
 
         const next = {
           label: body.label ?? existing.label,
@@ -138,49 +116,24 @@ export const addressRoutes = (database: Database = sharedDb) =>
           state: body.state ?? existing.state,
           postal_code: body.postal_code ?? existing.postal_code,
           country: body.country ?? existing.country,
+          // existing.is_default is the numeric 0|1 contract value; bind a JS
+          // boolean to the BOOLEAN column.
           is_default:
             body.is_default !== undefined
               ? body.is_default
-                ? 1
-                : 0
-              : existing.is_default,
+              : existing.is_default === 1,
         };
 
-        const updated = database
-          .query<
-            AddressRow,
-            [
-              string | null,
-              string | null,
-              string | null,
-              string | null,
-              string | null,
-              string | null,
-              string | null,
-              string | null,
-              number,
-              number,
-            ]
-          >(
-            `UPDATE addresses
-                SET label = ?, recipient = ?, line1 = ?, line2 = ?,
-                    city = ?, state = ?, postal_code = ?, country = ?,
-                    is_default = ?
-              WHERE id = ?
-              RETURNING *`,
-          )
-          .get(
-            next.label,
-            next.recipient,
-            next.line1,
-            next.line2,
-            next.city,
-            next.state,
-            next.postal_code,
-            next.country,
-            next.is_default,
-            existing.id,
-          );
+        const [updated] = (await database`
+          UPDATE addresses
+             SET label = ${next.label}, recipient = ${next.recipient},
+                 line1 = ${next.line1}, line2 = ${next.line2},
+                 city = ${next.city}, state = ${next.state},
+                 postal_code = ${next.postal_code}, country = ${next.country},
+                 is_default = ${next.is_default}
+           WHERE id = ${existing.id}
+           RETURNING ${database.unsafe(ADDRESS_COLUMNS)}
+        `) as [AddressRow?];
 
         return { address: updated };
       },
@@ -202,18 +155,16 @@ export const addressRoutes = (database: Database = sharedDb) =>
     // --- Delete an owned address ------------------------------------------
     .delete(
       "/:id",
-      ({ userId, params, set }) => {
-        const existing = database
-          .query<{ id: number }, [number, number]>(
-            "SELECT id FROM addresses WHERE id = ? AND user_id = ?",
-          )
-          .get(params.id, userId);
+      async ({ userId, params, set }) => {
+        const [existing] = (await database`
+          SELECT id FROM addresses WHERE id = ${params.id} AND user_id = ${userId}
+        `) as [{ id: number }?];
         if (!existing) {
           set.status = 404;
           return { error: "Address not found" };
         }
 
-        database.run("DELETE FROM addresses WHERE id = ?", [existing.id]);
+        await database`DELETE FROM addresses WHERE id = ${existing.id}`;
         return { success: true };
       },
       {

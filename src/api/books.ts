@@ -1,5 +1,5 @@
 import { Elysia, t } from "elysia";
-import type { Database } from "bun:sqlite";
+import type { SQL } from "bun";
 import { db as sharedDb } from "../db";
 
 /**
@@ -36,15 +36,28 @@ export interface BookRow {
 const DEFAULT_PAGE_SIZE = 12;
 const MAX_PAGE_SIZE = 100;
 
-/** The sort orders accepted by GET /books. */
-const SORTS = {
-  price_asc: "price_cents ASC, id ASC",
-  price_desc: "price_cents DESC, id ASC",
-  title: "title COLLATE NOCASE ASC, id ASC",
-  newest: "created_at DESC, id DESC",
-} as const;
+/**
+ * The sort orders accepted by GET /books, as Bun.sql ORDER BY fragments. The
+ * key is chosen from a fixed allowlist (never user input), so interpolating
+ * the chosen fragment is safe. Case-insensitive title sort uses LOWER(title)
+ * (Postgres LIKE/ORDER BY are case-sensitive, unlike SQLite's NOCASE).
+ */
+const SORT_KEYS = ["price_asc", "price_desc", "title", "newest"] as const;
+type SortKey = (typeof SORT_KEYS)[number];
 
-type SortKey = keyof typeof SORTS;
+function orderByFragment(database: SQL, key: SortKey) {
+  switch (key) {
+    case "price_asc":
+      return database`price_cents ASC, id ASC`;
+    case "price_desc":
+      return database`price_cents DESC, id ASC`;
+    case "title":
+      return database`LOWER(title) ASC, id ASC`;
+    case "newest":
+    default:
+      return database`created_at DESC, id DESC`;
+  }
+}
 
 /** Format a Date as a YYYY-MM-DD calendar day in UTC. */
 function toIsoDate(date: Date): string {
@@ -62,7 +75,7 @@ function toDisplayDate(date: Date): string {
   });
 }
 
-export const bookRoutes = (database: Database = sharedDb) =>
+export const bookRoutes = (database: SQL = sharedDb) =>
   new Elysia()
     .onError(({ code, set }) => {
       if (code === "VALIDATION") {
@@ -73,39 +86,43 @@ export const bookRoutes = (database: Database = sharedDb) =>
     // --- Listing with search / filter / sort / pagination -----------------
     .get(
       "/books",
-      ({ query }) => {
-        const where: string[] = [];
-        const params: Record<string, string | number> = {};
+      async ({ query }) => {
+        // Build the WHERE clause from parameterised Bun.sql fragments. User
+        // input is only ever bound (${...}), never string-interpolated. ILIKE
+        // gives case-insensitive title/author search (SQLite LIKE was already
+        // case-insensitive; Postgres LIKE is not).
+        const conds: SQL.Query<unknown>[] = [];
 
         if (query.search && query.search.trim().length > 0) {
           const like = `%${query.search.trim()}%`;
-          where.push("(title LIKE $search OR author LIKE $search)");
-          params.$search = like;
+          conds.push(database`(title ILIKE ${like} OR author ILIKE ${like})`);
         }
         if (query.category && query.category.trim().length > 0) {
-          where.push("category = $category");
-          params.$category = query.category.trim();
+          conds.push(database`category = ${query.category.trim()}`);
         }
         if (query.publisher && query.publisher.trim().length > 0) {
-          where.push("publisher = $publisher");
-          params.$publisher = query.publisher.trim();
+          conds.push(database`publisher = ${query.publisher.trim()}`);
         }
         if (typeof query.minPrice === "number") {
-          where.push("price_cents >= $minPrice");
-          params.$minPrice = Math.round(query.minPrice * 100);
+          conds.push(database`price_cents >= ${Math.round(query.minPrice * 100)}`);
         }
         if (typeof query.maxPrice === "number") {
-          where.push("price_cents <= $maxPrice");
-          params.$maxPrice = Math.round(query.maxPrice * 100);
+          conds.push(database`price_cents <= ${Math.round(query.maxPrice * 100)}`);
         }
 
-        const whereSql =
-          where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+        const whereSql = conds.length
+          ? conds.reduce(
+              (acc, c, i) => (i === 0 ? database`WHERE ${c}` : database`${acc} AND ${c}`),
+              database``,
+            )
+          : database``;
 
         const sortKey: SortKey = (
-          query.sort && query.sort in SORTS ? query.sort : "newest"
+          query.sort && SORT_KEYS.includes(query.sort as SortKey)
+            ? query.sort
+            : "newest"
         ) as SortKey;
-        const orderSql = SORTS[sortKey];
+        const orderSql = orderByFragment(database, sortKey);
 
         const page = query.page && query.page > 0 ? query.page : 1;
         const pageSize = Math.min(
@@ -116,20 +133,16 @@ export const bookRoutes = (database: Database = sharedDb) =>
         );
         const offset = (page - 1) * pageSize;
 
-        const totalRow = database
-          .query<{ total: number }, typeof params>(
-            `SELECT COUNT(*) AS total FROM books ${whereSql}`,
-          )
-          .get(params);
-        const total = totalRow?.total ?? 0;
+        const [totalRow] = await database`
+          SELECT COUNT(*)::int AS total FROM books ${whereSql}
+        `;
+        const total = Number(totalRow?.total ?? 0);
 
-        const items = database
-          .query<BookRow, Record<string, string | number>>(
-            `SELECT * FROM books ${whereSql}
-             ORDER BY ${orderSql}
-             LIMIT $limit OFFSET $offset`,
-          )
-          .all({ ...params, $limit: pageSize, $offset: offset });
+        const items = (await database`
+          SELECT * FROM books ${whereSql}
+          ORDER BY ${orderSql}
+          LIMIT ${pageSize} OFFSET ${offset}
+        `) as BookRow[];
 
         return { items, total, page, pageSize };
       },
@@ -154,38 +167,42 @@ export const bookRoutes = (database: Database = sharedDb) =>
       },
     )
     // --- Distinct categories with counts ----------------------------------
-    .get("/categories", () => {
-      const items = database
-        .query<{ category: string; count: number }, []>(
-          `SELECT category, COUNT(*) AS count
-             FROM books
-            WHERE category IS NOT NULL AND category <> ''
-            GROUP BY category
-            ORDER BY category COLLATE NOCASE ASC`,
-        )
-        .all();
+    .get("/categories", async () => {
+      const rows = (await database`
+        SELECT category, COUNT(*)::int AS count
+          FROM books
+         WHERE category IS NOT NULL AND category <> ''
+         GROUP BY category
+         ORDER BY LOWER(category) ASC
+      `) as { category: string; count: number }[];
+      const items = rows.map((r) => ({
+        category: r.category,
+        count: Number(r.count),
+      }));
       return { items };
     })
     // --- Distinct publishers with counts ----------------------------------
-    .get("/publishers", () => {
-      const items = database
-        .query<{ publisher: string; count: number }, []>(
-          `SELECT publisher, COUNT(*) AS count
-             FROM books
-            WHERE publisher IS NOT NULL AND publisher <> ''
-            GROUP BY publisher
-            ORDER BY publisher COLLATE NOCASE ASC`,
-        )
-        .all();
+    .get("/publishers", async () => {
+      const rows = (await database`
+        SELECT publisher, COUNT(*)::int AS count
+          FROM books
+         WHERE publisher IS NOT NULL AND publisher <> ''
+         GROUP BY publisher
+         ORDER BY LOWER(publisher) ASC
+      `) as { publisher: string; count: number }[];
+      const items = rows.map((r) => ({
+        publisher: r.publisher,
+        count: Number(r.count),
+      }));
       return { items };
     })
     // --- Single book + tentative delivery date + related products ---------
     .get(
       "/books/:id",
-      ({ params, set }) => {
-        const book = database
-          .query<BookRow, [number]>("SELECT * FROM books WHERE id = ?")
-          .get(params.id);
+      async ({ params, set }) => {
+        const [book] = (await database`
+          SELECT * FROM books WHERE id = ${params.id}
+        `) as [BookRow?];
 
         if (!book) {
           set.status = 404;
@@ -195,15 +212,15 @@ export const bookRoutes = (database: Database = sharedDb) =>
         const delivery = new Date();
         delivery.setUTCDate(delivery.getUTCDate() + book.delivery_lead_days);
 
-        const relatedProducts = database
-          .query<BookRow, [number, string | null, string, string | null]>(
-            `SELECT * FROM books
-              WHERE id <> ?
-                AND (category = ? OR author = ? OR publisher = ?)
-              ORDER BY rating DESC, id ASC
-              LIMIT 6`,
-          )
-          .all(book.id, book.category, book.author, book.publisher);
+        const relatedProducts = (await database`
+          SELECT * FROM books
+           WHERE id <> ${book.id}
+             AND (category = ${book.category}
+                  OR author = ${book.author}
+                  OR publisher = ${book.publisher})
+           ORDER BY rating DESC, id ASC
+           LIMIT 6
+        `) as BookRow[];
 
         return {
           book,

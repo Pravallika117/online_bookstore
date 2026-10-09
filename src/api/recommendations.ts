@@ -1,5 +1,5 @@
 import { Elysia } from "elysia";
-import type { Database } from "bun:sqlite";
+import type { SQL } from "bun";
 import { db as sharedDb } from "../db";
 import { authGuard } from "../lib/auth";
 import type { BookRow } from "./books";
@@ -26,57 +26,52 @@ import type { BookRow } from "./books";
 const LIMIT = 8;
 
 /** Top-rated, in-stock books — the popular fallback. */
-function popularFallback(database: Database, excludeIds: number[]): BookRow[] {
+async function popularFallback(
+  database: SQL,
+  excludeIds: number[],
+): Promise<BookRow[]> {
   if (excludeIds.length === 0) {
-    return database
-      .query<BookRow, [number]>(
-        `SELECT * FROM books
-          WHERE stock > 0
-          ORDER BY rating DESC, id ASC
-          LIMIT ?`,
-      )
-      .all(LIMIT);
+    return (await database`
+      SELECT * FROM books
+       WHERE stock > 0
+       ORDER BY rating DESC, id ASC
+       LIMIT ${LIMIT}
+    `) as BookRow[];
   }
-  const placeholders = excludeIds.map(() => "?").join(", ");
-  return database
-    .query<BookRow, (number | number)[]>(
-      `SELECT * FROM books
-        WHERE stock > 0
-          AND id NOT IN (${placeholders})
-        ORDER BY rating DESC, id ASC
-        LIMIT ?`,
-    )
-    .all(...excludeIds, LIMIT);
+  return (await database`
+    SELECT * FROM books
+     WHERE stock > 0
+       AND id NOT IN ${database(excludeIds)}
+     ORDER BY rating DESC, id ASC
+     LIMIT ${LIMIT}
+  `) as BookRow[];
 }
 
-export const recommendationRoutes = (database: Database = sharedDb) =>
+export const recommendationRoutes = (database: SQL = sharedDb) =>
   new Elysia()
     .use(authGuard(database))
-    .get("/recommendations", ({ userId }) => {
+    .get("/recommendations", async ({ userId }) => {
       // Book ids the user has already purchased (any non-cancelled order).
-      const purchasedIdRows = database
-        .query<{ book_id: number }, [number]>(
-          `SELECT DISTINCT oi.book_id
-             FROM order_items oi
-             JOIN orders o ON o.id = oi.order_id
-            WHERE o.user_id = ? AND o.status <> 'cancelled'`,
-        )
-        .all(userId);
+      const purchasedIdRows = (await database`
+        SELECT DISTINCT oi.book_id
+          FROM order_items oi
+          JOIN orders o ON o.id = oi.order_id
+         WHERE o.user_id = ${userId} AND o.status <> 'cancelled'
+      `) as { book_id: number }[];
       const purchasedIds = purchasedIdRows.map((r) => r.book_id);
 
       // The facets (category/author/publisher) of what they've bought.
-      const facetRows = database
-        .query<
-          { category: string | null; author: string; publisher: string | null },
-          [number]
-        >(
-          `SELECT DISTINCT b.category, b.author, b.publisher
-             FROM order_items oi
-             JOIN orders o ON o.id = oi.order_id
-             JOIN books b  ON b.id = oi.book_id
-            WHERE o.user_id = ? AND o.status <> 'cancelled'`,
-        )
-        .all(userId);
+      const facetRows = (await database`
+        SELECT DISTINCT b.category, b.author, b.publisher
+          FROM order_items oi
+          JOIN orders o ON o.id = oi.order_id
+          JOIN books b  ON b.id = oi.book_id
+         WHERE o.user_id = ${userId} AND o.status <> 'cancelled'
+      `) as {
+        category: string | null;
+        author: string;
+        publisher: string | null;
+      }[];
 
       const categories = new Set<string>();
       const authors = new Set<string>();
@@ -91,47 +86,42 @@ export const recommendationRoutes = (database: Database = sharedDb) =>
       let source: "history" | "popular" = "popular";
 
       if (categories.size + authors.size + publishers.size > 0) {
-        const clauses: string[] = [];
-        const bind: (string | number)[] = [];
-
+        // Compose the facet match as OR-ed parameterised IN fragments; each
+        // value set is bound via database(array), never string-interpolated.
+        const clauses: SQL.Query<unknown>[] = [];
         if (categories.size > 0) {
-          const ph = [...categories].map(() => "?").join(", ");
-          clauses.push(`category IN (${ph})`);
-          bind.push(...categories);
+          clauses.push(database`category IN ${database([...categories])}`);
         }
         if (authors.size > 0) {
-          const ph = [...authors].map(() => "?").join(", ");
-          clauses.push(`author IN (${ph})`);
-          bind.push(...authors);
+          clauses.push(database`author IN ${database([...authors])}`);
         }
         if (publishers.size > 0) {
-          const ph = [...publishers].map(() => "?").join(", ");
-          clauses.push(`publisher IN (${ph})`);
-          bind.push(...publishers);
+          clauses.push(database`publisher IN ${database([...publishers])}`);
         }
+        const facetSql = clauses.reduce((acc, c, i) =>
+          i === 0 ? c : database`${acc} OR ${c}`,
+        );
 
         const excludeSql =
           purchasedIds.length > 0
-            ? `AND id NOT IN (${purchasedIds.map(() => "?").join(", ")})`
-            : "";
+            ? database`AND id NOT IN ${database(purchasedIds)}`
+            : database``;
 
-        items = database
-          .query<BookRow, (string | number)[]>(
-            `SELECT * FROM books
-              WHERE stock > 0
-                AND (${clauses.join(" OR ")})
-                ${excludeSql}
-              ORDER BY rating DESC, id ASC
-              LIMIT ?`,
-          )
-          .all(...bind, ...purchasedIds, LIMIT);
+        items = (await database`
+          SELECT * FROM books
+           WHERE stock > 0
+             AND (${facetSql})
+             ${excludeSql}
+           ORDER BY rating DESC, id ASC
+           LIMIT ${LIMIT}
+        `) as BookRow[];
 
         if (items.length > 0) source = "history";
       }
 
       // Fallback (no history, or history produced nothing new to suggest).
       if (items.length === 0) {
-        items = popularFallback(database, purchasedIds);
+        items = await popularFallback(database, purchasedIds);
         source = "popular";
       }
 

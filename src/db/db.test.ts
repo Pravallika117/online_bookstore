@@ -1,26 +1,42 @@
-import { describe, expect, test } from "bun:test";
-import { Database } from "bun:sqlite";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import type { SQL } from "bun";
+import { openDb } from "./index";
 import { initSchema } from "./schema";
 import { seedIfEmpty } from "./seed";
 
-/** Spin up a throwaway in-memory DB with schema + seed applied. */
-function freshSeededDb(): Database {
-  const db = new Database(":memory:");
-  db.exec("PRAGMA foreign_keys = ON;");
-  initSchema(db);
-  seedIfEmpty(db);
-  return db;
-}
+/**
+ * Schema + seed tests against PostgreSQL via Bun.sql. The target is
+ * TEST_DATABASE_URL when set, otherwise the primary booksonline database
+ * (openDb() default). The suite is self-cleaning: it TRUNCATEs every table
+ * (RESTART IDENTITY CASCADE) before seeding and again at teardown, so it is
+ * independent of leftover rows from other suites and leaves no residue.
+ */
+
+const ALL_TABLES =
+  "order_items, orders, cart_items, carts, addresses, users, books";
+
+let db: SQL;
+
+beforeAll(async () => {
+  db = openDb(process.env.TEST_DATABASE_URL ?? undefined);
+  await initSchema(db);
+  await db.unsafe(`TRUNCATE ${ALL_TABLES} RESTART IDENTITY CASCADE`);
+  await seedIfEmpty(db);
+});
+
+afterAll(async () => {
+  await db.unsafe(`TRUNCATE ${ALL_TABLES} RESTART IDENTITY CASCADE`);
+  await db.end();
+});
 
 describe("db schema + seed", () => {
-  test("creates all expected tables", () => {
-    const db = freshSeededDb();
-    const names = db
-      .query<{ name: string }, []>(
-        "SELECT name FROM sqlite_master WHERE type = 'table'",
-      )
-      .all()
-      .map((r) => r.name);
+  test("creates all expected tables", async () => {
+    const rows = (await db`
+      SELECT table_name AS name
+        FROM information_schema.tables
+       WHERE table_schema = 'public'
+    `) as { name: string }[];
+    const names = rows.map((r) => r.name);
 
     for (const table of [
       "users",
@@ -33,61 +49,40 @@ describe("db schema + seed", () => {
     ]) {
       expect(names).toContain(table);
     }
-    db.close();
   });
 
-  test("seeds a non-empty catalogue", () => {
-    const db = freshSeededDb();
-    const row = db
-      .query<{ count: number }, []>("SELECT COUNT(*) AS count FROM books")
-      .get();
-    expect(row!.count).toBeGreaterThan(0);
-    db.close();
+  test("seeds a non-empty catalogue", async () => {
+    const [row] = await db`SELECT COUNT(*)::int AS count FROM books`;
+    expect(Number(row!.count)).toBeGreaterThan(0);
   });
 
-  test("spans at least 4 categories and 3 publishers", () => {
-    const db = freshSeededDb();
-    const categories = db
-      .query<{ count: number }, []>(
-        "SELECT COUNT(DISTINCT category) AS count FROM books",
-      )
-      .get();
-    const publishers = db
-      .query<{ count: number }, []>(
-        "SELECT COUNT(DISTINCT publisher) AS count FROM books",
-      )
-      .get();
-    expect(categories!.count).toBeGreaterThanOrEqual(4);
-    expect(publishers!.count).toBeGreaterThanOrEqual(3);
-    db.close();
+  test("spans at least 4 categories and 3 publishers", async () => {
+    const [categories] =
+      await db`SELECT COUNT(DISTINCT category)::int AS count FROM books`;
+    const [publishers] =
+      await db`SELECT COUNT(DISTINCT publisher)::int AS count FROM books`;
+    expect(Number(categories!.count)).toBeGreaterThanOrEqual(4);
+    expect(Number(publishers!.count)).toBeGreaterThanOrEqual(3);
   });
 
-  test("every seeded book has a cover_url and a positive price_cents", () => {
-    const db = freshSeededDb();
-    const bad = db
-      .query<{ count: number }, []>(
-        `SELECT COUNT(*) AS count FROM books
-         WHERE cover_url IS NULL OR cover_url = '' OR price_cents <= 0`,
-      )
-      .get();
-    expect(bad!.count).toBe(0);
-    db.close();
+  test("every seeded book has a cover_url and a positive price_cents", async () => {
+    const [bad] = await db`
+      SELECT COUNT(*)::int AS count FROM books
+       WHERE cover_url IS NULL OR cover_url = '' OR price_cents <= 0
+    `;
+    expect(Number(bad!.count)).toBe(0);
   });
 
-  test("seedIfEmpty is idempotent", () => {
-    const db = freshSeededDb();
-    const before = db
-      .query<{ count: number }, []>("SELECT COUNT(*) AS count FROM books")
-      .get()!.count;
+  test("seedIfEmpty is idempotent", async () => {
+    const [{ count: before }] =
+      await db`SELECT COUNT(*)::int AS count FROM books`;
 
     // Running it again must not duplicate rows.
-    seedIfEmpty(db);
-    seedIfEmpty(db);
+    await seedIfEmpty(db);
+    await seedIfEmpty(db);
 
-    const after = db
-      .query<{ count: number }, []>("SELECT COUNT(*) AS count FROM books")
-      .get()!.count;
-    expect(after).toBe(before);
-    db.close();
+    const [{ count: after }] =
+      await db`SELECT COUNT(*)::int AS count FROM books`;
+    expect(Number(after)).toBe(Number(before));
   });
 });

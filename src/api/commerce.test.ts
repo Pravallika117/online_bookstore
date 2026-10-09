@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { Elysia } from "elysia";
-import { Database } from "bun:sqlite";
+import type { SQL } from "bun";
+import { openDb } from "../db";
 import { initSchema } from "../db/schema";
 import { authRoutes } from "./auth";
 import { cartRoutes } from "./cart";
@@ -8,16 +9,18 @@ import { addressRoutes } from "./addresses";
 import { orderRoutes } from "./orders";
 
 /**
- * Commerce (cart + addresses + orders) tests against an in-memory bun:sqlite
- * database so the real store.sqlite is never touched. Two users A and B are
- * registered to exercise strict per-user isolation. The checkout flow,
- * point-redemption clamping, buy-again, cancel-within-48h, and the >48h
- * server-side rejection are all covered.
+ * Commerce (cart + addresses + orders) tests against PostgreSQL via Bun.sql.
+ * The target is TEST_DATABASE_URL when set, otherwise the primary booksonline
+ * database. Two users A and B are registered to exercise strict per-user
+ * isolation. The checkout flow, point-redemption clamping, buy-again,
+ * cancel-within-48h, and the >48h server-side rejection are all covered. The
+ * suite TRUNCATEs every table (RESTART IDENTITY CASCADE) before and after so
+ * it is isolated and leaves nothing behind.
  */
 
 type App = ReturnType<typeof buildApp>;
 
-function buildApp(database: Database) {
+function buildApp(database: SQL) {
   return new Elysia({ prefix: "/api" })
     .use(authRoutes(database))
     .use(cartRoutes(database))
@@ -25,8 +28,11 @@ function buildApp(database: Database) {
     .use(orderRoutes(database));
 }
 
+const ALL_TABLES =
+  "order_items, orders, cart_items, carts, addresses, users, books";
+
 let app: App;
-let db: Database;
+let db: SQL;
 let tokenA = "";
 let tokenB = "";
 let userAId = 0;
@@ -57,25 +63,23 @@ const patch = (p: string, token?: string, body?: unknown) =>
   req("PATCH", p, token, body);
 
 /** Insert one seed book directly so we control price/stock in assertions. */
-function seedOneBook(database: Database): number {
-  const row = database
-    .query<{ id: number }, []>(
-      `INSERT INTO books (title, author, publisher, description, price_cents,
-                          category, cover_url, stock, rating, delivery_lead_days)
-       VALUES ('Test Book', 'Test Author', 'Test Pub', 'desc', 50000,
-               'Fiction', 'http://cover', 10, 4.5, 4)
-       RETURNING id`,
-    )
-    .get();
-  return row!.id;
+async function seedOneBook(database: SQL): Promise<number> {
+  const [row] = (await database`
+    INSERT INTO books (title, author, publisher, description, price_cents,
+                       category, cover_url, stock, rating, delivery_lead_days)
+    VALUES ('Test Book', 'Test Author', 'Test Pub', 'desc', 50000,
+            'Fiction', 'http://cover', 10, 4.5, 4)
+    RETURNING id
+  `) as [{ id: number }];
+  return row.id;
 }
 
 beforeAll(async () => {
-  db = new Database(":memory:");
-  db.exec("PRAGMA foreign_keys = ON;");
-  initSchema(db);
+  db = openDb(process.env.TEST_DATABASE_URL ?? undefined);
+  await initSchema(db);
+  await db.unsafe(`TRUNCATE ${ALL_TABLES} RESTART IDENTITY CASCADE`);
   app = buildApp(db);
-  bookId = seedOneBook(db);
+  bookId = await seedOneBook(db);
 
   const regA = await post("/api/auth/register", undefined, {
     email: "a@example.com",
@@ -95,11 +99,12 @@ beforeAll(async () => {
   tokenB = dataB.token;
 
   // Give user A a known gift_points balance for redemption clamping tests.
-  db.run("UPDATE users SET gift_points = 100 WHERE id = ?", [userAId]);
+  await db`UPDATE users SET gift_points = 100 WHERE id = ${userAId}`;
 });
 
-afterAll(() => {
-  db.close();
+afterAll(async () => {
+  await db.unsafe(`TRUNCATE ${ALL_TABLES} RESTART IDENTITY CASCADE`);
+  await db.end();
 });
 
 describe("cart", () => {
@@ -194,23 +199,21 @@ describe("checkout", () => {
   });
 
   it("decremented stock and cleared the cart", async () => {
-    const stock = db
-      .query<{ stock: number }, [number]>("SELECT stock FROM books WHERE id = ?")
-      .get(bookId);
-    expect(stock!.stock).toBe(8); // 10 - 2
+    const [stock] = (await db`SELECT stock FROM books WHERE id = ${bookId}`) as [
+      { stock: number },
+    ];
+    expect(stock.stock).toBe(8); // 10 - 2
 
     const cartRes = await get("/api/cart", tokenA);
     const cart = (await cartRes.json()) as { items: unknown[] };
     expect(cart.items.length).toBe(0);
   });
 
-  it("updated user A's gift_points (−30 redeemed, +9 earned => 79)", () => {
-    const row = db
-      .query<{ gift_points: number }, [number]>(
-        "SELECT gift_points FROM users WHERE id = ?",
-      )
-      .get(userAId);
-    expect(row!.gift_points).toBe(79);
+  it("updated user A's gift_points (−30 redeemed, +9 earned => 79)", async () => {
+    const [row] = (await db`
+      SELECT gift_points FROM users WHERE id = ${userAId}
+    `) as [{ gift_points: number }];
+    expect(row.gift_points).toBe(79);
   });
 
   it("rejects checkout with an empty cart (400)", async () => {
@@ -275,40 +278,33 @@ describe("order history, buy-again, cancel", () => {
   });
 
   it("cancels within the window: restores stock and refunds points", async () => {
-    const before = db
-      .query<{ stock: number }, [number]>("SELECT stock FROM books WHERE id = ?")
-      .get(bookId)!.stock;
-    const order = db
-      .query<
-        { points_redeemed: number; points_earned: number; quantity: number },
-        [number]
-      >(
-        `SELECT o.points_redeemed, o.points_earned,
-                (SELECT SUM(quantity) FROM order_items WHERE order_id = o.id) AS quantity
-           FROM orders o WHERE o.id = ?`,
-      )
-      .get(orderId)!;
-    const pointsBefore = db
-      .query<{ gift_points: number }, [number]>(
-        "SELECT gift_points FROM users WHERE id = ?",
-      )
-      .get(userAId)!.gift_points;
+    const [{ stock: before }] = (await db`
+      SELECT stock FROM books WHERE id = ${bookId}
+    `) as [{ stock: number }];
+    const [order] = (await db`
+      SELECT o.points_redeemed, o.points_earned,
+             (SELECT SUM(quantity)::int FROM order_items WHERE order_id = o.id) AS quantity
+        FROM orders o WHERE o.id = ${orderId}
+    `) as [
+      { points_redeemed: number; points_earned: number; quantity: number },
+    ];
+    const [{ gift_points: pointsBefore }] = (await db`
+      SELECT gift_points FROM users WHERE id = ${userAId}
+    `) as [{ gift_points: number }];
 
     const res = await post(`/api/orders/${orderId}/cancel`, tokenA);
     expect(res.status).toBe(200);
     const data = (await res.json()) as { order: { status: string } };
     expect(data.order.status).toBe("cancelled");
 
-    const after = db
-      .query<{ stock: number }, [number]>("SELECT stock FROM books WHERE id = ?")
-      .get(bookId)!.stock;
-    expect(after).toBe(before + order.quantity);
+    const [{ stock: after }] = (await db`
+      SELECT stock FROM books WHERE id = ${bookId}
+    `) as [{ stock: number }];
+    expect(after).toBe(before + Number(order.quantity));
 
-    const pointsAfter = db
-      .query<{ gift_points: number }, [number]>(
-        "SELECT gift_points FROM users WHERE id = ?",
-      )
-      .get(userAId)!.gift_points;
+    const [{ gift_points: pointsAfter }] = (await db`
+      SELECT gift_points FROM users WHERE id = ${userAId}
+    `) as [{ gift_points: number }];
     expect(pointsAfter).toBe(
       pointsBefore + order.points_redeemed - order.points_earned,
     );
@@ -318,16 +314,15 @@ describe("order history, buy-again, cancel", () => {
     // Build a paid order for A with placed_at + cancellable_until in the past.
     const past = new Date(Date.now() - 72 * 60 * 60 * 1000).toISOString();
     const pastEnd = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-    const stale = db
-      .query<{ id: number }, [number, string, string]>(
-        `INSERT INTO orders
-           (user_id, address_snapshot, status, payment_method,
-            subtotal_cents, points_redeemed, points_earned, total_cents,
-            placed_at, cancellable_until)
-         VALUES (?, '{}', 'paid', 'MOCK', 50000, 0, 5, 50000, ?, ?)
-         RETURNING id`,
-      )
-      .get(userAId, past, pastEnd)!;
+    const [stale] = (await db`
+      INSERT INTO orders
+        (user_id, address_snapshot, status, payment_method,
+         subtotal_cents, points_redeemed, points_earned, total_cents,
+         placed_at, cancellable_until)
+      VALUES (${userAId}, '{}', 'paid', 'MOCK', 50000, 0, 5, 50000,
+              ${past}, ${pastEnd})
+      RETURNING id
+    `) as [{ id: number }];
 
     const res = await post(`/api/orders/${stale.id}/cancel`, tokenA);
     expect(res.status).toBe(403);
@@ -335,11 +330,9 @@ describe("order history, buy-again, cancel", () => {
     expect(data.error).toBe("Cancellation window expired");
 
     // The order must remain 'paid'.
-    const status = db
-      .query<{ status: string }, [number]>(
-        "SELECT status FROM orders WHERE id = ?",
-      )
-      .get(stale.id)!.status;
+    const [{ status }] = (await db`
+      SELECT status FROM orders WHERE id = ${stale.id}
+    `) as [{ status: string }];
     expect(status).toBe("paid");
   });
 });

@@ -1,5 +1,5 @@
 import { Elysia, t } from "elysia";
-import type { Database } from "bun:sqlite";
+import type { SQL } from "bun";
 import { db as sharedDb } from "../db";
 import {
   authGuard,
@@ -21,7 +21,7 @@ import {
  * The password hash is never returned. The `database` argument is injectable
  * so tests can supply a temp DB; it defaults to the shared singleton.
  */
-export const authRoutes = (database: Database = sharedDb) =>
+export const authRoutes = (database: SQL = sharedDb) =>
   new Elysia({ prefix: "/auth" })
     // Shape validation failures as a consistent { error } with status 400.
     .onError(({ code, error, set }) => {
@@ -37,11 +37,7 @@ export const authRoutes = (database: Database = sharedDb) =>
       async ({ body, set }) => {
         const email = body.email.trim().toLowerCase();
 
-        const existing = database
-          .query<{ id: number }, [string]>(
-            "SELECT id FROM users WHERE email = ?",
-          )
-          .get(email);
+        const [existing] = await database`SELECT id FROM users WHERE email = ${email}`;
         if (existing) {
           set.status = 409;
           return { error: "Email already registered" };
@@ -49,13 +45,11 @@ export const authRoutes = (database: Database = sharedDb) =>
 
         const password_hash = await hashPassword(body.password);
 
-        const inserted = database
-          .query<UserRow, [string, string, string]>(
-            `INSERT INTO users (email, password_hash, name, gift_points)
-             VALUES (?, ?, ?, 0)
-             RETURNING *`,
-          )
-          .get(email, password_hash, body.name.trim());
+        const [inserted] = (await database`
+          INSERT INTO users (email, password_hash, name, gift_points)
+          VALUES (${email}, ${password_hash}, ${body.name.trim()}, 0)
+          RETURNING *
+        `) as [UserRow?];
 
         // RETURNING guarantees a row here; guard defensively for the types.
         if (!inserted) {
@@ -64,7 +58,7 @@ export const authRoutes = (database: Database = sharedDb) =>
         }
 
         // Provision the user's cart row so later cart operations have a home.
-        database.run("INSERT INTO carts (user_id) VALUES (?)", [inserted.id]);
+        await database`INSERT INTO carts (user_id) VALUES (${inserted.id})`;
 
         const user: PublicUser = toPublicUser(inserted);
         set.status = 201;
@@ -83,9 +77,9 @@ export const authRoutes = (database: Database = sharedDb) =>
       async ({ body, set }) => {
         const email = body.email.trim().toLowerCase();
 
-        const row = database
-          .query<UserRow, [string]>("SELECT * FROM users WHERE email = ?")
-          .get(email);
+        const [row] = (await database`SELECT * FROM users WHERE email = ${email}`) as [
+          UserRow?,
+        ];
 
         if (!row || !(await verifyPassword(body.password, row.password_hash))) {
           set.status = 401;

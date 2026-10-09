@@ -1,4 +1,4 @@
-import type { Database } from "bun:sqlite";
+import type { SQL } from "bun";
 
 /**
  * A real, popular book for the storefront catalogue.
@@ -346,37 +346,23 @@ const SEED_BOOKS: SeedBook[] = [
  * COUNT guard short-circuits once rows exist. Users are intentionally NOT
  * seeded — the auth FEAT owns account creation.
  */
-export function seedIfEmpty(db: Database): void {
-  const row = db
-    .query<{ count: number }, []>("SELECT COUNT(*) AS count FROM books")
-    .get();
-  if (row && row.count > 0) return;
+export async function seedIfEmpty(db: SQL): Promise<void> {
+  const [row] = await db`SELECT COUNT(*)::int AS count FROM books`;
+  if (row && Number(row.count) > 0) return;
 
-  const insert = db.prepare(
-    `INSERT INTO books
-       (title, author, publisher, description, price_cents, category,
-        cover_url, stock, rating, delivery_lead_days)
-     VALUES
-       ($title, $author, $publisher, $description, $price_cents, $category,
-        $cover_url, $stock, $rating, $delivery_lead_days)`,
-  );
-
-  const insertAll = db.transaction((books: SeedBook[]) => {
-    for (const b of books) {
-      insert.run({
-        $title: b.title,
-        $author: b.author,
-        $publisher: b.publisher,
-        $description: b.description,
-        $price_cents: b.price_cents,
-        $category: b.category,
-        $cover_url: b.cover_url,
-        $stock: b.stock,
-        $rating: b.rating,
-        $delivery_lead_days: b.delivery_lead_days,
-      });
+  // IDENTITY assigns ids; inserts never specify id, so no sequence reset is
+  // needed. The whole batch runs in one transaction (ROLLBACK on any error).
+  await db.begin(async (tx) => {
+    for (const b of SEED_BOOKS) {
+      await tx`
+        INSERT INTO books
+          (title, author, publisher, description, price_cents, category,
+           cover_url, stock, rating, delivery_lead_days)
+        VALUES
+          (${b.title}, ${b.author}, ${b.publisher}, ${b.description},
+           ${b.price_cents}, ${b.category}, ${b.cover_url}, ${b.stock},
+           ${b.rating}, ${b.delivery_lead_days})
+      `;
     }
   });
-
-  insertAll(SEED_BOOKS);
 }

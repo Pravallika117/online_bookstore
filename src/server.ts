@@ -3,8 +3,9 @@ import { api } from "./api";
 import { initDb } from "./db";
 
 // Create the schema and seed the catalogue (idempotent) before serving so the
-// first boot provisions store.sqlite and later boots are no-ops.
-initDb();
+// first boot provisions the PostgreSQL tables + catalogue and later boots are
+// no-ops. Bun.sql is async, so initialisation is awaited (top-level await).
+await initDb();
 
 const port = Number(process.env.PORT) || 3000;
 const isDevelopment = process.env.NODE_ENV !== "production";

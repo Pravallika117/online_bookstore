@@ -1,5 +1,5 @@
 import { Elysia, t } from "elysia";
-import type { Database } from "bun:sqlite";
+import type { SQL } from "bun";
 import { db as sharedDb } from "../db";
 import { authGuard } from "../lib/auth";
 import { buildCartView } from "./cart";
@@ -66,10 +66,10 @@ export interface OrderView extends Omit<OrderRow, "address_snapshot"> {
 }
 
 /**
- * SQLite stores placed_at / cancellable_until as UTC "YYYY-MM-DD HH:MM:SS"
- * (CURRENT_TIMESTAMP) or ISO strings we insert. Parse to epoch ms, treating a
- * bare timestamp as UTC. Returns NaN for unparseable input (treated as
- * expired by callers).
+ * placed_at / cancellable_until are stored as ISO-8601 strings (the exact
+ * value the checkout inserts via new Date().toISOString()). Parse to epoch
+ * ms. A bare "YYYY-MM-DD HH:MM:SS" (e.g. a now()::text default) is treated as
+ * UTC. Returns NaN for unparseable input (treated as expired by callers).
  */
 function parseSqlTime(value: string): number {
   // Already ISO with timezone?
@@ -79,12 +79,10 @@ function parseSqlTime(value: string): number {
 }
 
 /** Assemble an OrderView from a stored order row. */
-function toOrderView(database: Database, order: OrderRow): OrderView {
-  const items = database
-    .query<OrderItemRow, [number]>(
-      "SELECT * FROM order_items WHERE order_id = ? ORDER BY id ASC",
-    )
-    .all(order.id);
+async function toOrderView(database: SQL, order: OrderRow): Promise<OrderView> {
+  const items = (await database`
+    SELECT * FROM order_items WHERE order_id = ${order.id} ORDER BY id ASC
+  `) as OrderItemRow[];
 
   let address: unknown = null;
   try {
@@ -100,7 +98,7 @@ function toOrderView(database: Database, order: OrderRow): OrderView {
   return { ...rest, address, items, isCancellable };
 }
 
-export const orderRoutes = (database: Database = sharedDb) =>
+export const orderRoutes = (database: SQL = sharedDb) =>
   new Elysia({ prefix: "/orders" })
     .onError(({ code, set }) => {
       if (code === "VALIDATION") {
@@ -112,24 +110,20 @@ export const orderRoutes = (database: Database = sharedDb) =>
     // --- Checkout: create a 'paid' order from the cart --------------------
     .post(
       "/",
-      ({ userId, user, body, set }) => {
+      async ({ userId, user, body, set }) => {
         // Resolve the user's cart.
-        const cart = database
-          .query<{ id: number }, [number]>(
-            "SELECT id FROM carts WHERE user_id = ?",
-          )
-          .get(userId);
+        const [cart] = (await database`
+          SELECT id FROM carts WHERE user_id = ${userId}
+        `) as [{ id: number }?];
         if (!cart) {
           set.status = 400;
           return { error: "Cart is empty" };
         }
 
         // Verify the chosen address belongs to the user.
-        const address = database
-          .query<AddressRow, [number, number]>(
-            "SELECT * FROM addresses WHERE id = ? AND user_id = ?",
-          )
-          .get(body.address_id, userId);
+        const [address] = (await database`
+          SELECT * FROM addresses WHERE id = ${body.address_id} AND user_id = ${userId}
+        `) as [AddressRow?];
         if (!address) {
           set.status = 404;
           return { error: "Address not found" };
@@ -138,33 +132,30 @@ export const orderRoutes = (database: Database = sharedDb) =>
         const redeemRequested = body.redeem_points ?? 0;
 
         try {
-          const result = database.transaction(() => {
+          // begin() rolls back on throw and rethrows, so a CheckoutError
+          // thrown inside aborts the whole order; we map it below.
+          const result = await database.begin(async (tx) => {
             // Re-read lines + CURRENT book prices/stock from the DB; never
             // trust any client-supplied amount.
-            const lines = database
-              .query<
-                {
-                  book_id: number;
-                  quantity: number;
-                  title: string;
-                  author: string;
-                  price_cents: number;
-                  stock: number;
-                },
-                [number]
-              >(
-                `SELECT ci.book_id    AS book_id,
-                        ci.quantity   AS quantity,
-                        b.title       AS title,
-                        b.author      AS author,
-                        b.price_cents AS price_cents,
-                        b.stock       AS stock
-                   FROM cart_items ci
-                   JOIN books b ON b.id = ci.book_id
-                  WHERE ci.cart_id = ?
-                  ORDER BY ci.id ASC`,
-              )
-              .all(cart.id);
+            const lines = (await tx`
+              SELECT ci.book_id    AS book_id,
+                     ci.quantity   AS quantity,
+                     b.title       AS title,
+                     b.author      AS author,
+                     b.price_cents AS price_cents,
+                     b.stock       AS stock
+                FROM cart_items ci
+                JOIN books b ON b.id = ci.book_id
+               WHERE ci.cart_id = ${cart.id}
+               ORDER BY ci.id ASC
+            `) as {
+              book_id: number;
+              quantity: number;
+              title: string;
+              author: string;
+              price_cents: number;
+              stock: number;
+            }[];
 
             if (lines.length === 0) {
               throw new CheckoutError(400, "Cart is empty");
@@ -203,17 +194,17 @@ export const orderRoutes = (database: Database = sharedDb) =>
 
             // Decrement stock for every line.
             for (const line of lines) {
-              database.run(
-                "UPDATE books SET stock = stock - ? WHERE id = ?",
-                [line.quantity, line.book_id],
-              );
+              await tx`
+                UPDATE books SET stock = stock - ${line.quantity} WHERE id = ${line.book_id}
+              `;
             }
 
             // Adjust the user's gift_points: subtract redeemed, add earned.
-            database.run(
-              "UPDATE users SET gift_points = gift_points - ? + ? WHERE id = ?",
-              [points_redeemed, points_earned, userId],
-            );
+            await tx`
+              UPDATE users
+                 SET gift_points = gift_points - ${points_redeemed} + ${points_earned}
+               WHERE id = ${userId}
+            `;
 
             const now = new Date();
             const placed_at = now.toISOString();
@@ -221,66 +212,37 @@ export const orderRoutes = (database: Database = sharedDb) =>
               now.getTime() + 48 * 60 * 60 * 1000,
             ).toISOString();
 
-            const order = database
-              .query<
-                OrderRow,
-                [
-                  number,
-                  string,
-                  string,
-                  number,
-                  number,
-                  number,
-                  number,
-                  string,
-                  string,
-                ]
-              >(
-                `INSERT INTO orders
-                   (user_id, address_snapshot, status, payment_method,
-                    subtotal_cents, points_redeemed, points_earned, total_cents,
-                    placed_at, cancellable_until)
-                 VALUES (?, ?, 'paid', ?, ?, ?, ?, ?, ?, ?)
-                 RETURNING *`,
-              )
-              .get(
-                userId,
-                JSON.stringify(address),
-                body.payment_method ?? "MOCK",
-                subtotal_cents,
-                points_redeemed,
-                points_earned,
-                total_cents,
-                placed_at,
-                cancellable_until,
-              );
+            const [order] = (await tx`
+              INSERT INTO orders
+                (user_id, address_snapshot, status, payment_method,
+                 subtotal_cents, points_redeemed, points_earned, total_cents,
+                 placed_at, cancellable_until)
+              VALUES (${userId}, ${JSON.stringify(address)}, 'paid',
+                      ${body.payment_method ?? "MOCK"}, ${subtotal_cents},
+                      ${points_redeemed}, ${points_earned}, ${total_cents},
+                      ${placed_at}, ${cancellable_until})
+              RETURNING *
+            `) as [OrderRow?];
 
             if (!order) throw new CheckoutError(500, "Failed to create order");
 
             for (const line of lines) {
-              database.run(
-                `INSERT INTO order_items
-                   (order_id, book_id, title, author, unit_price_cents, quantity)
-                 VALUES (?, ?, ?, ?, ?, ?)`,
-                [
-                  order.id,
-                  line.book_id,
-                  line.title,
-                  line.author,
-                  line.price_cents,
-                  line.quantity,
-                ],
-              );
+              await tx`
+                INSERT INTO order_items
+                  (order_id, book_id, title, author, unit_price_cents, quantity)
+                VALUES (${order.id}, ${line.book_id}, ${line.title},
+                        ${line.author}, ${line.price_cents}, ${line.quantity})
+              `;
             }
 
             // Clear the cart.
-            database.run("DELETE FROM cart_items WHERE cart_id = ?", [cart.id]);
+            await tx`DELETE FROM cart_items WHERE cart_id = ${cart.id}`;
 
             return order;
-          })();
+          });
 
           set.status = 201;
-          return { order: toOrderView(database, result) };
+          return { order: await toOrderView(database, result as OrderRow) };
         } catch (err) {
           if (err instanceof CheckoutError) {
             set.status = err.status;
@@ -298,40 +260,37 @@ export const orderRoutes = (database: Database = sharedDb) =>
       },
     )
     // --- List the user's orders (newest first) ----------------------------
-    .get("/", ({ userId }) => {
-      const orders = database
-        .query<OrderRow, [number]>(
-          "SELECT * FROM orders WHERE user_id = ? ORDER BY datetime(placed_at) DESC, id DESC",
-        )
-        .all(userId);
-      return { orders: orders.map((o) => toOrderView(database, o)) };
+    .get("/", async ({ userId }) => {
+      const orders = (await database`
+        SELECT * FROM orders WHERE user_id = ${userId}
+         ORDER BY placed_at DESC, id DESC
+      `) as OrderRow[];
+      return {
+        orders: await Promise.all(orders.map((o) => toOrderView(database, o))),
+      };
     })
     // --- Single owned order -----------------------------------------------
     .get(
       "/:id",
-      ({ userId, params, set }) => {
-        const order = database
-          .query<OrderRow, [number, number]>(
-            "SELECT * FROM orders WHERE id = ? AND user_id = ?",
-          )
-          .get(params.id, userId);
+      async ({ userId, params, set }) => {
+        const [order] = (await database`
+          SELECT * FROM orders WHERE id = ${params.id} AND user_id = ${userId}
+        `) as [OrderRow?];
         if (!order) {
           set.status = 404;
           return { error: "Order not found" };
         }
-        return { order: toOrderView(database, order) };
+        return { order: await toOrderView(database, order) };
       },
       { params: t.Object({ id: t.Numeric() }) },
     )
     // --- Cancel within the 48h window (server-enforced) -------------------
     .post(
       "/:id/cancel",
-      ({ userId, params, set }) => {
-        const order = database
-          .query<OrderRow, [number, number]>(
-            "SELECT * FROM orders WHERE id = ? AND user_id = ?",
-          )
-          .get(params.id, userId);
+      async ({ userId, params, set }) => {
+        const [order] = (await database`
+          SELECT * FROM orders WHERE id = ${params.id} AND user_id = ${userId}
+        `) as [OrderRow?];
         if (!order) {
           set.status = 404;
           return { error: "Order not found" };
@@ -348,102 +307,89 @@ export const orderRoutes = (database: Database = sharedDb) =>
           return { error: "Cancellation window expired" };
         }
 
-        const updated = database.transaction(() => {
+        const updated = await database.begin(async (tx) => {
           // Restore stock for each line.
-          const items = database
-            .query<OrderItemRow, [number]>(
-              "SELECT * FROM order_items WHERE order_id = ?",
-            )
-            .all(order.id);
+          const items = (await tx`
+            SELECT * FROM order_items WHERE order_id = ${order.id}
+          `) as OrderItemRow[];
           for (const item of items) {
-            database.run("UPDATE books SET stock = stock + ? WHERE id = ?", [
-              item.quantity,
-              item.book_id,
-            ]);
+            await tx`
+              UPDATE books SET stock = stock + ${item.quantity} WHERE id = ${item.book_id}
+            `;
           }
 
           // Refund redeemed points and reverse earned points.
-          database.run(
-            "UPDATE users SET gift_points = gift_points + ? - ? WHERE id = ?",
-            [order.points_redeemed, order.points_earned, userId],
-          );
+          await tx`
+            UPDATE users
+               SET gift_points = gift_points + ${order.points_redeemed} - ${order.points_earned}
+             WHERE id = ${userId}
+          `;
 
-          return database
-            .query<OrderRow, [number]>(
-              "UPDATE orders SET status = 'cancelled' WHERE id = ? RETURNING *",
-            )
-            .get(order.id)!;
-        })();
+          const [row] = (await tx`
+            UPDATE orders SET status = 'cancelled' WHERE id = ${order.id} RETURNING *
+          `) as [OrderRow?];
+          return row!;
+        });
 
-        return { order: toOrderView(database, updated) };
+        return { order: await toOrderView(database, updated as OrderRow) };
       },
       { params: t.Object({ id: t.Numeric() }) },
     )
     // --- Buy again: re-add the order's books to the current cart ----------
     .post(
       "/:id/buy-again",
-      ({ userId, params, set }) => {
-        const order = database
-          .query<{ id: number }, [number, number]>(
-            "SELECT id FROM orders WHERE id = ? AND user_id = ?",
-          )
-          .get(params.id, userId);
+      async ({ userId, params, set }) => {
+        const [order] = (await database`
+          SELECT id FROM orders WHERE id = ${params.id} AND user_id = ${userId}
+        `) as [{ id: number }?];
         if (!order) {
           set.status = 404;
           return { error: "Order not found" };
         }
 
-        const cart = database
-          .query<{ id: number }, [number]>(
-            "SELECT id FROM carts WHERE user_id = ?",
-          )
-          .get(userId);
-        const cartId =
-          cart?.id ??
-          database
-            .query<{ id: number }, [number]>(
-              "INSERT INTO carts (user_id) VALUES (?) RETURNING id",
-            )
-            .get(userId)!.id;
+        const [cart] = (await database`
+          SELECT id FROM carts WHERE user_id = ${userId}
+        `) as [{ id: number }?];
+        let cartId = cart?.id;
+        if (cartId === undefined) {
+          const [created] = (await database`
+            INSERT INTO carts (user_id) VALUES (${userId}) RETURNING id
+          `) as [{ id: number }?];
+          cartId = created!.id;
+        }
 
-        database.transaction(() => {
-          const items = database
-            .query<{ book_id: number; quantity: number }, [number]>(
-              "SELECT book_id, quantity FROM order_items WHERE order_id = ?",
-            )
-            .all(order.id);
+        await database.begin(async (tx) => {
+          const items = (await tx`
+            SELECT book_id, quantity FROM order_items WHERE order_id = ${order.id}
+          `) as { book_id: number; quantity: number }[];
 
           for (const item of items) {
             // Only re-add books that still exist and have stock.
-            const book = database
-              .query<{ stock: number }, [number]>(
-                "SELECT stock FROM books WHERE id = ?",
-              )
-              .get(item.book_id);
+            const [book] = (await tx`
+              SELECT stock FROM books WHERE id = ${item.book_id}
+            `) as [{ stock: number }?];
             if (!book || book.stock <= 0) continue;
 
-            const existing = database
-              .query<{ id: number; quantity: number }, [number, number]>(
-                "SELECT id, quantity FROM cart_items WHERE cart_id = ? AND book_id = ?",
-              )
-              .get(cartId, item.book_id);
+            const [existing] = (await tx`
+              SELECT id, quantity FROM cart_items
+               WHERE cart_id = ${cartId} AND book_id = ${item.book_id}
+            `) as [{ id: number; quantity: number }?];
 
             const desired = (existing?.quantity ?? 0) + item.quantity;
             const clamped = Math.min(desired, book.stock);
 
             if (existing) {
-              database.run("UPDATE cart_items SET quantity = ? WHERE id = ?", [
-                clamped,
-                existing.id,
-              ]);
+              await tx`
+                UPDATE cart_items SET quantity = ${clamped} WHERE id = ${existing.id}
+              `;
             } else {
-              database.run(
-                "INSERT INTO cart_items (cart_id, book_id, quantity) VALUES (?, ?, ?)",
-                [cartId, item.book_id, Math.min(item.quantity, book.stock)],
-              );
+              await tx`
+                INSERT INTO cart_items (cart_id, book_id, quantity)
+                VALUES (${cartId}, ${item.book_id}, ${Math.min(item.quantity, book.stock)})
+              `;
             }
           }
-        })();
+        });
 
         return buildCartView(database, cartId);
       },

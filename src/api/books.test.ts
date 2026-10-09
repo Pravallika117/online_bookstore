@@ -1,35 +1,42 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { Elysia } from "elysia";
-import { Database } from "bun:sqlite";
+import type { SQL } from "bun";
+import { openDb } from "../db";
 import { initSchema } from "../db/schema";
 import { seedIfEmpty } from "../db/seed";
 import { bookRoutes, type BookRow } from "./books";
 
 /**
- * Catalogue endpoint tests against an in-memory, freshly seeded bun:sqlite
- * database so the real store.sqlite is never touched. The app is composed
- * exactly like the real /api app but with the temp DB injected.
+ * Catalogue endpoint tests against PostgreSQL via Bun.sql. The target is
+ * TEST_DATABASE_URL when set, otherwise the primary booksonline database. The
+ * suite TRUNCATEs every table (RESTART IDENTITY CASCADE) before seeding so
+ * book ids are deterministic (the detail test relies on books/1), and again
+ * at teardown so it leaves nothing behind.
  */
 
 type App = ReturnType<typeof buildApp>;
 
-function buildApp(database: Database) {
+function buildApp(database: SQL) {
   return new Elysia({ prefix: "/api" }).use(bookRoutes(database));
 }
 
-let app: App;
-let db: Database;
+const ALL_TABLES =
+  "order_items, orders, cart_items, carts, addresses, users, books";
 
-beforeAll(() => {
-  db = new Database(":memory:");
-  db.exec("PRAGMA foreign_keys = ON;");
-  initSchema(db);
-  seedIfEmpty(db);
+let app: App;
+let db: SQL;
+
+beforeAll(async () => {
+  db = openDb(process.env.TEST_DATABASE_URL ?? undefined);
+  await initSchema(db);
+  await db.unsafe(`TRUNCATE ${ALL_TABLES} RESTART IDENTITY CASCADE`);
+  await seedIfEmpty(db);
   app = buildApp(db);
 });
 
-afterAll(() => {
-  db.close();
+afterAll(async () => {
+  await db.unsafe(`TRUNCATE ${ALL_TABLES} RESTART IDENTITY CASCADE`);
+  await db.end();
 });
 
 async function getJson<T>(path: string): Promise<{ status: number; data: T }> {

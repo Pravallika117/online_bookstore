@@ -1,54 +1,63 @@
-import { Database } from "bun:sqlite";
-import { resolve } from "node:path";
+import { SQL } from "bun";
 import { initSchema } from "./schema";
 import { seedIfEmpty } from "./seed";
 
 /**
- * Resolve the on-disk location of store.sqlite.
+ * PostgreSQL connection module, backed by Bun's built-in SQL client
+ * (`import { SQL } from "bun"`). No external driver, ORM, or Node tooling is
+ * involved: Bun ships a complete Promise-based Postgres client (tagged
+ * templates, pooling, transactions, RETURNING).
  *
- * The path is anchored to the project root (two levels up from this file:
- * src/db -> src -> root) rather than process.cwd(), so the database lands in
- * the workspace root no matter where `bun` is launched from. Tests and other
- * callers can override this with the DB_PATH env var (e.g. ":memory:" or a
- * temp file) to avoid touching the real store.sqlite.
+ * All credentials live here and nowhere else. The app connects via the
+ * DATABASE_URL environment variable; when it is unset the documented default
+ * below is used. Tests may override the target with TEST_DATABASE_URL so they
+ * never have to touch the primary connection string.
+ *
+ * Money convention is unchanged by this layer: every *_cents column is an
+ * INTEGER number of paise (1 INR = 100 paise).
  */
-function resolveDbPath(): string {
-  const override = process.env.DB_PATH;
-  if (override && override.length > 0) return override;
-  return resolve(import.meta.dir, "..", "..", "store.sqlite");
+
+/** The documented default connection string used when DATABASE_URL is unset. */
+export const DEFAULT_DATABASE_URL =
+  "postgres://postgres:password@localhost:5432/booksonline";
+
+/**
+ * Resolve the connection string for the primary (application) connection.
+ * Reads DATABASE_URL, falling back to the documented default. The string is
+ * built explicitly here rather than relying on Bun's implicit env detection
+ * so the default is honoured and credentials are not scattered.
+ */
+export function connectionString(): string {
+  const fromEnv = process.env.DATABASE_URL;
+  if (fromEnv && fromEnv.length > 0) return fromEnv;
+  return DEFAULT_DATABASE_URL;
 }
 
 /**
- * Open a bun:sqlite database with sane pragmas.
- *
- * - WAL journaling gives better read/write concurrency for the API process.
- *   It is skipped for ":memory:" where WAL is meaningless.
- * - foreign_keys = ON enforces the REFERENCES constraints declared in the
- *   schema (SQLite leaves them off by default).
+ * Open a Bun.sql connection. Callers (notably tests) may pass an explicit
+ * URL; otherwise the resolved application connection string is used. Tests
+ * typically pass `process.env.TEST_DATABASE_URL ?? undefined` so an unset
+ * override transparently falls back to the primary string.
  */
-export function openDb(path: string = resolveDbPath()): Database {
-  const db = new Database(path, { create: true });
-  if (path !== ":memory:") {
-    db.exec("PRAGMA journal_mode = WAL;");
-  }
-  db.exec("PRAGMA foreign_keys = ON;");
-  return db;
+export function openDb(url: string = connectionString()): SQL {
+  return new SQL(url);
 }
 
 /**
  * Create the schema and seed the catalogue if empty. Both operations are
- * idempotent, so calling this on every boot is safe: the first run creates
- * and populates store.sqlite, later runs are no-ops.
+ * idempotent, so awaiting this on every boot is safe: the first run creates
+ * the tables and populates the catalogue, later runs are no-ops. Bun.sql is
+ * async, so initialisation (and every call site) is now Promise-based.
  */
-export function initDb(database: Database = db): Database {
-  initSchema(database);
-  seedIfEmpty(database);
+export async function initDb(database: SQL = db): Promise<SQL> {
+  await initSchema(database);
+  await seedIfEmpty(database);
   return database;
 }
 
 /**
- * The shared singleton connection used by the API route modules. Opening it
- * at import time means the first `import { db }` wires up the schema+seed via
- * initDb() in server.ts before the server starts serving requests.
+ * The shared singleton connection used by the API route modules. Constructing
+ * it at import time means the first `import { db }` wires up the connection;
+ * `await initDb()` in server.ts applies the schema+seed before serving.
  */
-export const db: Database = openDb();
+export const db: SQL = openDb();
