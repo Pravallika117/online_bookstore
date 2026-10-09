@@ -1,0 +1,7 @@
+{
+  "task_id": "task-booksonline",
+  "task_description": "Scaffold a production-ready, 100% Bun-native full-stack E-Commerce bookstore 'BooksOnline' from scratch: a single Bun.serve() process serving an ElysiaJS REST API under /api/* and a React + Tailwind v4 + shadcn/ui (new-york) frontend bundled via Bun HTML imports; bun:sqlite persistence with auto schema+seed; real JWT auth with Bun.password hashing and strict per-user data isolation; and every customer-journey feature (auth, order history + buy-again + recommendations, category/publisher browse, book detail with tentative delivery date + related products, cart, saved addresses, simulated payment with gift-point redemption, payment+order confirmation, and server-enforced cancel-within-48h) built end to end across DB + API + UI.",
+  "status": "pending",
+  "feature_order": ["FEAT-001", "FEAT-002", "FEAT-003", "FEAT-004", "FEAT-005", "FEAT-006"],
+  "blocked_reason": null
+}

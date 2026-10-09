@@ -1,0 +1,28 @@
+{
+  "id": "FEAT-004",
+  "type": "feat",
+  "description": "Public catalogue API plus history-based recommendations. Books listing with search/filter/sort/pagination, categories and publishers lists, book detail enriched with a computed tentative delivery date and related products, and GET /api/recommendations (auth; driven by the user's order history with a popular/top-rated fallback). Depends on FEAT-002 (books/orders tables) and FEAT-003 (auth guard for recommendations). Satisfies journey items 3,5,6,7 and the base catalogue/search/filter/sort requirements.",
+  "status": "pending",
+  "steps": [
+    "Create c:\\Users\\PravallikaP\\Documents\\FDE capstone\\online_bookstore\\src\\api\\books.ts: GET /books with query params (search over title+author, category, publisher, minPrice, maxPrice in rupees->converted to paise, sort in {price_asc, price_desc, title, newest}, page + pageSize) validated via Elysia t with sensible defaults; build a parameterized SQL query (prepared statements, never string interpolation of user input) and return { items, total, page, pageSize }. GET /categories returns distinct categories with book counts. GET /publishers returns distinct publishers with book counts.",
+    "In src/api/books.ts add GET /books/:id returning the book plus (a) a tentative delivery date = today + delivery_lead_days formatted ISO/display, and (b) relatedProducts: up to ~6 other books sharing category OR author OR publisher, excluding the book itself, ordered by rating. Return 404 { error } if the id does not exist.",
+    "Create c:\\Users\\PravallikaP\\Documents\\FDE capstone\\online_bookstore\\src\\api\\recommendations.ts: GET /recommendations protected by the auth guard. Derive the user's purchased categories/authors/publishers from their orders+order_items; recommend books in those categories/by those authors/publishers that they have NOT already bought, ordered by rating/popularity. If the user has no order history, fall back to popular/top-rated books (highest rating, in-stock). Always return a non-empty list when the catalog is non-empty.",
+    "Mount books + recommendations route modules in src/api/index.ts (.use) so they resolve under /api/*.",
+    "Create c:\\Users\\PravallikaP\\Documents\\FDE capstone\\online_bookstore\\src\\api\\books.test.ts using a temp seeded DB: GET /books returns seeded items + total; search narrows results; category and publisher filters narrow results; price range filters correctly (INR->paise); each sort order returns the expected ordering; pagination returns the right page slice; GET /categories and /publishers return >=1 entries with counts; GET /books/:id returns a tentative delivery date and non-empty relatedProducts for a seeded id and 404 for a missing id.",
+    "Create c:\\Users\\PravallikaP\\Documents\\FDE capstone\\online_bookstore\\src\\api\\recommendations.test.ts: for a user with no orders, /recommendations returns popular fallback (non-empty); for a user with a seeded order in a known category, the results favor that category/author/publisher and exclude already-purchased titles."
+  ],
+  "acceptance_criteria": [
+    "GET /api/books returns seeded books and supports search, category, publisher, minPrice/maxPrice (INR), sort (price/title/newest), and pagination.",
+    "GET /api/categories and GET /api/publishers return the seeded categories and publishers with counts.",
+    "GET /api/books/:id returns the book with a computed tentative delivery date and a non-empty related-products list, and 404 for unknown ids.",
+    "GET /api/recommendations (authenticated) returns history-driven results and a sensible popular fallback when the user has no history.",
+    "`bun test` passes the books and recommendations tests; `bunx tsc --noEmit` is clean."
+  ],
+  "verification": [
+    "Run `bun test src/api/books.test.ts src/api/recommendations.test.ts` (and full `bun test`) and confirm all pass.",
+    "Run `bunx tsc --noEmit` and confirm zero errors.",
+    "Boot the server background/bounded; Invoke-RestMethod http://localhost:3000/api/books (expect items), .../api/books?category=<one>&sort=price_asc (expect filtered+sorted), .../api/categories, .../api/publishers, .../api/books/1 (expect deliveryDate + relatedProducts). With a $token from a registered user, Invoke-RestMethod .../api/recommendations -Headers @{Authorization=\"Bearer $token\"} (expect non-empty). Stop the server afterward."
+  ],
+  "blocked_reason": null,
+  "findings": ""
+}

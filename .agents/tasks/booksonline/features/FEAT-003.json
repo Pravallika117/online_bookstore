@@ -1,0 +1,27 @@
+{
+  "id": "FEAT-003",
+  "type": "feat",
+  "description": "Real backend authentication: register, login, and me endpoints with Bun.password hashing (argon2/bcrypt) and stateless JWT, plus a reusable auth guard that later protected routes use to resolve the authenticated user id. Nothing security-relevant is trusted from the client. Depends on FEAT-002 (users table) and FEAT-001 (Elysia app composition). This FEAT establishes the per-user isolation primitive that FEAT-005 relies on.",
+  "status": "pending",
+  "steps": [
+    "Create c:\\Users\\PravallikaP\\Documents\\FDE capstone\\online_bookstore\\src\\lib\\auth.ts: read JWT secret from process.env.JWT_SECRET with a documented dev fallback constant (e.g. 'dev-only-insecure-secret-change-me'); export signToken(userId) and verifyToken(token) producing/validating a stateless JWT (HS256) with an expiry (e.g. 7d). Use Bun.password.hash / Bun.password.verify for password hashing (argon2id default). Export hashPassword/verifyPassword wrappers. Export an Elysia-compatible guard (a `derive`/`resolve` or `macro`) that reads the Authorization: Bearer header, verifies the JWT, loads the user from the DB, and exposes { userId, user } to handlers; if missing/invalid it throws a 401 with JSON { error: 'Unauthorized' }.",
+    "Create c:\\Users\\PravallikaP\\Documents\\FDE capstone\\online_bookstore\\src\\api\\auth.ts: an Elysia instance exposing POST /register (body validated with Elysia t.Object: email, password min length, name), POST /login (email, password), GET /me (protected by the auth guard). register: reject duplicate email with 409 { error }, hash the password, insert the user with gift_points default (e.g. 0 or a small welcome balance), create the user's cart row, return { token, user } (never return password_hash). login: look up by email, verifyPassword, on success return { token, user }, on failure 401 { error: 'Invalid credentials' }. me: return the current user (id, email, name, gift_points) from the guard. Validation failures return 400 with a consistent JSON error shape.",
+    "Mount auth routes in c:\\Users\\PravallikaP\\Documents\\FDE capstone\\online_bookstore\\src\\api\\index.ts via .use(authRoutes) so endpoints resolve under /api/auth/*.",
+    "Add GET /api/points (or fold the gift_points balance into /api/auth/me) returning the authenticated user's gift_points; keep whichever the frontend will call documented in findings.",
+    "Create c:\\Users\\PravallikaP\\Documents\\FDE capstone\\online_bookstore\\src\\api\\auth.test.ts using a temp DB: register a user (expect token + user, no password_hash), reject duplicate email (409), login with correct creds (token), reject wrong password (401), call /me without a token (401) and with the token (200 returns the user), and verify a tampered/garbage token is rejected (401)."
+  ],
+  "acceptance_criteria": [
+    "POST /api/auth/register creates a user with a Bun.password-hashed password and returns a JWT and the user object without password_hash; duplicate email returns 409.",
+    "POST /api/auth/login returns a valid JWT for correct credentials and 401 for wrong credentials.",
+    "GET /api/auth/me returns the authenticated user for a valid Bearer token and 401 without/with an invalid token.",
+    "The exported auth guard resolves userId from the JWT and is reusable by other route modules.",
+    "`bun test` passes the auth tests and `bunx tsc --noEmit` is clean."
+  ],
+  "verification": [
+    "Run `bun test src/api/auth.test.ts` (and the full `bun test`) and confirm all auth tests pass.",
+    "Run `bunx tsc --noEmit` and confirm zero errors.",
+    "Boot the server background/bounded, then with Invoke-RestMethod: POST /api/auth/register, POST /api/auth/login to capture $token, GET /api/auth/me with header @{ Authorization = \"Bearer $token\" } (expect the user), and GET /api/auth/me with no header (expect 401 via Invoke-WebRequest -UseBasicParsing checking StatusCode). Stop the server afterward."
+  ],
+  "blocked_reason": null,
+  "findings": ""
+}
