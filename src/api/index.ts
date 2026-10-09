@@ -1,12 +1,13 @@
 import { Elysia } from "elysia";
+import { authRoutes } from "./auth";
 
 /**
- * Root API app mounted at the `/api` prefix. Later FEATs attach the domain
- * route modules (auth, books, cart, addresses, orders, recommendations) here
- * via `.use(...)`. For the scaffold it exposes only a health check.
+ * Root API app mounted at the `/api` prefix. Domain route modules (auth, and
+ * later books, cart, addresses, orders, recommendations) attach here via
+ * `.use(...)`. Auth routes resolve under /api/auth/*.
  */
-export const api = new Elysia({ prefix: "/api" }).get("/health", () => ({
-  status: "ok",
-}));
+export const api = new Elysia({ prefix: "/api" })
+  .get("/health", () => ({ status: "ok" }))
+  .use(authRoutes());
 
 export type Api = typeof api;
